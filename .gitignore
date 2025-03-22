@@ -1,0 +1,13 @@
+.idea
+__pycache__
+
+.vscode
+.env
+
+/stop
+
+/views.sql
+/config.py
+
+account_mapping.json
+
