@@ -9,7 +9,7 @@ import sys
 
 import config
 from db.db import create_or_get
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Module-level database connection
 _con = None
@@ -23,6 +23,32 @@ class SecurityInfo:
 class TransactionEntry:
     txn_str: str
     is_invbanktran: bool
+
+@dataclass
+class FitIdGenerator:
+    """Generates unique transaction IDs for each account and date combination."""
+    _counters: dict[str, dict[str, int]] = field(default_factory=dict)
+    
+    def generate(self, account_id: str, date_str: str) -> str:
+        """
+        Generate a unique FITID for a transaction.
+        
+        Args:
+            account_id: The account identifier
+            date_str: The transaction date in YYYYMMDD format
+            
+        Returns:
+            A unique FITID string in format: ACC_YYYYMMDD_NNN where NNN is the counter
+        """
+        if account_id not in self._counters:
+            self._counters[account_id] = {}
+            
+        if date_str not in self._counters[account_id]:
+            self._counters[account_id][date_str] = 1
+        else:
+            self._counters[account_id][date_str] += 1
+            
+        return f"{account_id}_{date_str}_{self._counters[account_id][date_str]:03d}"
 
 # --- Helper Functions ---
 
@@ -530,14 +556,13 @@ def generate_asset_transfer(row: dict[str, str], fitid: str, date_str: str) -> t
         out += "  </TRANSFER>\n"
         return out, generate_buysell_security_info(row)
 
-def generate_transaction(row: dict[str, str], counter: int) -> tuple[TransactionEntry, SecurityInfo]:
+def generate_transaction(row: dict[str, str], fitid: str) -> tuple[TransactionEntry, SecurityInfo]:
     """
     Generate a QFX transaction block based on the activity type in the input row.
     
     Args:
-        row (dict[str, str]): Dictionary containing transaction data with keys like
-            'Date', 'Activity', etc. from the CSV row
-        counter (int): Sequential counter used to generate unique FITID
+        row (dict[str, str]): Dictionary containing transaction data
+        fitid (str): The unique transaction ID to use
             
     Returns:
         tuple[TransactionEntry, SecurityInfo]: A tuple containing:
@@ -560,7 +585,6 @@ def generate_transaction(row: dict[str, str], counter: int) -> tuple[Transaction
     """
     dt_obj = parse_date(row["Date"])
     date_str = dt_obj.strftime("%Y%m%d") if dt_obj else "00000000"
-    fitid = f"TXN{date_str}{counter:04d}"
     act_lower = row["Activity"].strip().lower()
 
     if is_funding_activity(row): # This needs to be done before detecting "buy"s because "funding activity" is labeled as "buy"
@@ -587,7 +611,6 @@ def generate_transaction(row: dict[str, str], counter: int) -> tuple[Transaction
         return _make_txn_entry(generate_buysell_transaction(row, False, fitid, date_str, 0.0), False)
     else:
         raise ValueError(f"Unknown activity: {row['Activity']}")
-
 
 def _output_from_input(input : str) -> str:
     if input.endswith('.csv'):
@@ -618,12 +641,11 @@ def main() -> None:
     # Load missing CUSIP mappings
     _missing_cusip_mappings = load_missing_cusip_mapping(args.account_mapping)
     
-    transactions: list[TransactionEntry] = []
-    counter = 1
-    first_account = None
-    min_date = None
-    max_date = None
+    # Modified to store transactions by account
+    transactions_by_account: dict[str, list[TransactionEntry]] = {}
+    dates_by_account: dict[str, tuple[datetime.datetime | None, datetime.datetime | None]] = {}
     securities: dict[str, SecurityInfo] = {}  # keyed by CUSIP, value = symbol
+    fitid_generator = FitIdGenerator()
 
     with open(args.input_csv, newline='', encoding='utf-8-sig') as csvfile:
         reader = csv.reader(csvfile)
@@ -645,31 +667,36 @@ def main() -> None:
         normalized_fieldnames = [normalize_header(field) for field in raw_fieldnames]
         for row_ in valid_lines:
             row = dict(zip(normalized_fieldnames, row_))
-            if first_account is None:
-                first_account = row["Account"].strip()
+            account = row["Account"].strip()
+            account_id = get_account_id(account, account_mapping)
+            
+            # Initialize account data structures if needed
+            if account not in transactions_by_account:
+                transactions_by_account[account] = []
+                dates_by_account[account] = (None, None)  # (min_date, max_date)
+            
+            # Update min/max dates for this account
             dt_obj = parse_date(row["Date"])
             if dt_obj:
+                date_str = dt_obj.strftime("%Y%m%d")
+                min_date, max_date = dates_by_account[account]
                 if min_date is None or dt_obj < min_date:
                     min_date = dt_obj
                 if max_date is None or dt_obj > max_date:
                     max_date = dt_obj
-            txn_entry, secid_info = generate_transaction(row, counter)
-            if secid_info is not None and secid_info.uniqueid not in securities:
-                securities[secid_info.uniqueid] = secid_info
-            transactions.append(txn_entry)
-            counter += 1
+                dates_by_account[account] = (min_date, max_date)
+                
+                # Generate FITID using account and date
+                fitid = fitid_generator.generate(account_id, date_str)
+                txn_entry, secid_info = generate_transaction(row, fitid)
+                if secid_info is not None and secid_info.uniqueid not in securities:
+                    securities[secid_info.uniqueid] = secid_info
+                transactions_by_account[account].append(txn_entry)
+            else:
+                print(f"Warning: Skipping row with invalid date: {row['Date']}")
 
-    if first_account is None:
-        raise ValueError("No account information found in CSV.")
-    account_id = get_account_id(first_account, account_mapping)
-    dtstart_str = format_ofx_datetime(min_date)
-    dtend_str = format_ofx_datetime(max_date)
     dtasof = datetime.datetime.now().strftime("%Y%m%d")
     dtnow = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-    # Preserve CSV order for non-fee transactions; collect fee transactions separately.
-    non_fee_txns = [txn.txn_str for txn in transactions if not txn.is_invbanktran]
-    invbanktrans = [txn.txn_str for txn in transactions if txn.is_invbanktran] 
-    all_txns = non_fee_txns + invbanktrans
 
     # Build the main QFX file.
     qfx_lines = [
@@ -701,35 +728,56 @@ def main() -> None:
         "      <INTU.USERID>U424465</INTU.USERID>",
         "    </SONRS>",
         "  </SIGNONMSGSRSV1>",
-        "  <INVSTMTMSGSRSV1>",
-        "    <INVSTMTTRNRS>",
-        "      <TRNUID>0</TRNUID>",
-        "      <STATUS>",
-        "        <CODE>0</CODE>",
-        "        <SEVERITY>INFO</SEVERITY>",
-        "      </STATUS>",
-        "      <INVSTMTRS>",
-        f"        <DTASOF>{dtasof}</DTASOF>",
-        "        <CURDEF>USD</CURDEF>",
-        "        <INVACCTFROM>",
-        "          <BROKERID>WellsFargo</BROKERID>",
-        f"          <ACCTID>{account_id}</ACCTID>",
-        "        </INVACCTFROM>",
-        "        <INVTRANLIST>",
-        f"          <DTSTART>{dtstart_str}</DTSTART>",
-        f"          <DTEND>{dtend_str}</DTEND>"
+        "  <INVSTMTMSGSRSV1>"
     ]
-    for txn in all_txns:
-        qfx_lines.append(txn.rstrip())
-    qfx_lines.append("        </INVTRANLIST>")
-    qfx_lines.append("        <INVBAL>")
-    qfx_lines.append("          <AVAILCASH>0.00</AVAILCASH>")
-    qfx_lines.append("          <MARGINBALANCE>0.00</MARGINBALANCE>")
-    qfx_lines.append("          <SHORTBALANCE>0.00</SHORTBALANCE>")
-    qfx_lines.append("        </INVBAL>")
-    qfx_lines.append("      </INVSTMTRS>")
-    qfx_lines.append("    </INVSTMTTRNRS>")
+
+    # Generate INVSTMTRS section for each account
+    for account, transactions in transactions_by_account.items():
+        account_id = get_account_id(account, account_mapping)
+        min_date, max_date = dates_by_account[account]
+        dtstart_str = format_ofx_datetime(min_date)
+        dtend_str = format_ofx_datetime(max_date)
+
+        # Separate fee and non-fee transactions
+        non_fee_txns = [txn.txn_str for txn in transactions if not txn.is_invbanktran]
+        invbanktrans = [txn.txn_str for txn in transactions if txn.is_invbanktran] 
+        all_txns = non_fee_txns + invbanktrans
+
+        qfx_lines.extend([
+            "    <INVSTMTTRNRS>",
+            "      <TRNUID>0</TRNUID>",
+            "      <STATUS>",
+            "        <CODE>0</CODE>",
+            "        <SEVERITY>INFO</SEVERITY>",
+            "      </STATUS>",
+            "      <INVSTMTRS>",
+            f"        <DTASOF>{dtasof}</DTASOF>",
+            "        <CURDEF>USD</CURDEF>",
+            "        <INVACCTFROM>",
+            "          <BROKERID>WellsFargo</BROKERID>",
+            f"          <ACCTID>{account_id}</ACCTID>",
+            "        </INVACCTFROM>",
+            "        <INVTRANLIST>",
+            f"          <DTSTART>{dtstart_str}</DTSTART>",
+            f"          <DTEND>{dtend_str}</DTEND>"
+        ])
+
+        for txn in all_txns:
+            qfx_lines.append(txn.rstrip())
+
+        qfx_lines.extend([
+            "        </INVTRANLIST>",
+            "        <INVBAL>",
+            "          <AVAILCASH>0.00</AVAILCASH>",
+            "          <MARGINBALANCE>0.00</MARGINBALANCE>",
+            "          <SHORTBALANCE>0.00</SHORTBALANCE>",
+            "        </INVBAL>",
+            "      </INVSTMTRS>",
+            "    </INVSTMTTRNRS>"
+        ])
+
     qfx_lines.append("  </INVSTMTMSGSRSV1>")
+
     # Build the SECLIST section with STOCKINFO and MFINFO (if interest was found).
     if securities:
         qfx_lines.extend([
@@ -737,7 +785,7 @@ def main() -> None:
             "    <SECLIST>"
         ])
         for _, security_info in securities.items():
-            qfx_lines.append("      " +security_info.info_entry.strip())
+            qfx_lines.append("      " + security_info.info_entry.strip())
         qfx_lines.extend([
             "    </SECLIST>",
             "  </SECLISTMSGSRSV1>"
