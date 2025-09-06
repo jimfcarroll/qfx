@@ -472,13 +472,11 @@ def generate_intrest_transaction(row: dict[str, str], fitid: str, date_str: str)
     the made-up fund (WFPBNAE). For other income types, if a SECID is provided in the CSV,
     it is used.
     """
-    amount = normalize_currency(row["Amount"])
-
     stmttrn =   "          <INVBANKTRAN>\n"
     stmttrn +=  "            <STMTTRN>\n"
     stmttrn += f"              <TRNTYPE>INT</TRNTYPE>\n"
     stmttrn += f"              <DTPOSTED>{date_str}</DTPOSTED>\n"
-    stmttrn += f"              <TRNAMT>{normalize_currency(row['Amount'], amount)}</TRNAMT>\n"
+    stmttrn += f"              <TRNAMT>{normalize_currency(row['Amount'])}</TRNAMT>\n"
     stmttrn += f"              <FITID>{fitid}</FITID>\n"
     stmttrn += f"              <MEMO>{row['Activity'].strip()}: {xml_escape(row['Description'].strip())}</MEMO>\n"
     stmttrn +=  "              <CURRENCY>\n"
@@ -556,7 +554,7 @@ def generate_asset_transfer(row: dict[str, str], fitid: str, date_str: str) -> t
         out += "  </TRANSFER>\n"
         return out, generate_buysell_security_info(row)
 
-def generate_transaction(row: dict[str, str], fitid: str) -> tuple[TransactionEntry, SecurityInfo]:
+def generate_transaction(row: dict[str, str], fitid: str, dontFailUnknown: bool) -> tuple[TransactionEntry, SecurityInfo]:
     """
     Generate a QFX transaction block based on the activity type in the input row.
     
@@ -610,7 +608,11 @@ def generate_transaction(row: dict[str, str], fitid: str) -> tuple[TransactionEn
     elif act_lower in {"reinvest dist"}:
         return _make_txn_entry(generate_buysell_transaction(row, False, fitid, date_str, 0.0), False)
     else:
-        raise ValueError(f"Unknown activity: {row['Activity']}")
+        if dontFailUnknown:
+            print(f"WARNING: Unknwon activity type: {row['Activity']}")
+            return None, None
+        else:
+            raise ValueError(f"Unknown activity: {row['Activity']}")
 
 def _output_from_input(input : str) -> str:
     if input.endswith('.csv'):
@@ -630,6 +632,7 @@ def main() -> None:
     parser.add_argument("output_qfx", nargs='?', default=None, help="Path to the output QFX file")
     parser.add_argument("--account_mapping", default=default_mapping_path,
                        help=f"Path to the JSON account mapping file (default: {default_mapping_path})")
+    parser.add_argument("--dontFailUnknown", action="store_true", default=False, help="Do not fail when an unknown transaction type is found")
     args = parser.parse_args()
 
     if not args.output_qfx:
@@ -688,10 +691,11 @@ def main() -> None:
                 
                 # Generate FITID using account and date
                 fitid = fitid_generator.generate(account_id, date_str)
-                txn_entry, secid_info = generate_transaction(row, fitid)
-                if secid_info is not None and secid_info.uniqueid not in securities:
-                    securities[secid_info.uniqueid] = secid_info
-                transactions_by_account[account].append(txn_entry)
+                txn_entry, secid_info = generate_transaction(row, fitid, args.dontFailUnknown)
+                if txn_entry is not None: # None indicates a row couldn't be processed and a Warning was emitted
+                    if secid_info is not None and secid_info.uniqueid not in securities:
+                        securities[secid_info.uniqueid] = secid_info
+                    transactions_by_account[account].append(txn_entry)
             else:
                 print(f"Warning: Skipping row with invalid date: {row['Date']}")
 
